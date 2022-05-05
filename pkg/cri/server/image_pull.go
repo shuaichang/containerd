@@ -33,20 +33,22 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/containerd/imgcrypt"
+	"github.com/containerd/imgcrypt/images/encryption"
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
+
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/labels"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/pkg/cri/annotations"
+	criconfig "github.com/containerd/containerd/pkg/cri/config"
 	distribution "github.com/containerd/containerd/reference/docker"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/remotes/docker/config"
-	"github.com/containerd/imgcrypt"
-	"github.com/containerd/imgcrypt/images/encryption"
-	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
-	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
-
-	criconfig "github.com/containerd/containerd/pkg/cri/config"
 )
 
 // For image management:
@@ -126,10 +128,17 @@ func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 		}
 	)
 
+	defer pcancel()
+	snapshotter, err := c.snapshotterFromPodSandboxConfig(ctx, ref, r.SandboxConfig)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get snapshotter for %q", ref)
+	}
+	log.G(ctx).Debugf("PullImage %q with snapshotter %s", ref, snapshotter)
+
 	pullOpts := []containerd.RemoteOpt{
 		containerd.WithSchema1Conversion, //nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
 		containerd.WithResolver(resolver),
-		containerd.WithPullSnapshotter(c.config.ContainerdConfig.Snapshotter),
+		containerd.WithPullSnapshotter(snapshotter),
 		containerd.WithPullUnpack,
 		containerd.WithPullLabel(imageLabelKey, imageLabelValue),
 		containerd.WithMaxConcurrentDownloads(c.config.MaxConcurrentDownloads),
@@ -785,4 +794,30 @@ func (rt *pullRequestReporterRoundTripper) RoundTrip(req *http.Request) (*http.R
 		reqReporter: rt.reqReporter,
 	}
 	return resp, err
+}
+
+// Given that runtime information is not passed from PullImageRequest, we depend on an experimental annotation
+// passed from pod sandbox config to get the runtimeHandler. The annotation key is specified in configuration.
+// Once we know the runtime, try to override default snapshotter if it is set for this runtime.
+// See https://github.com/containerd/containerd/issues/6657
+func (c *criService) snapshotterFromPodSandboxConfig(ctx context.Context, imageRef string,
+	s *runtime.PodSandboxConfig) (string, error) {
+	snapshotter := c.config.ContainerdConfig.Snapshotter
+	if s == nil || s.Annotations == nil {
+		return snapshotter, nil
+	}
+
+	runtimeHandler, ok := s.Annotations[annotations.RuntimeHandler]
+	if !ok {
+		return snapshotter, nil
+	}
+
+	ociRuntime, err := c.getSandboxRuntime(s, runtimeHandler)
+	if err != nil {
+		return "", errors.Wrapf(err, "experimental: failed to get sandbox runtime for %s", runtimeHandler)
+	}
+
+	snapshotter = c.runtimeSnapshotter(context.Background(), ociRuntime)
+	log.G(ctx).Infof("experimental: PullImage %q for runtime %s, using snapshotter %s", imageRef, runtimeHandler, snapshotter)
+	return snapshotter, nil
 }
